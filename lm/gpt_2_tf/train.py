@@ -15,6 +15,7 @@ import tensorflow as tf
 import tqdm
 
 from . import model, sample
+from . import memory_saving_gradients
 from lm.data import END_OF_TEXT
 from lm.fire_utils import only_allow_defined_args
 
@@ -38,7 +39,7 @@ def train(
         restore_from=None,  # latest by default, or "path/model-STEP"
         save_every=1000,
         log_every=20,
-        config='default',
+        config='117M',
         accum_gradients=1,  # accumulate gradients N times
         find_lr=False,  # instead of normal training, run lr range finder
         validate=False,  # instead of training, run validation and exit
@@ -48,6 +49,7 @@ def train(
         n_embd=None,
         n_head=None,
         n_layer=None,
+        gradient_checkpointing=False, # memory saving gradients
         ):
 
     sp_model = spm.SentencePieceProcessor()
@@ -128,7 +130,13 @@ def train(
             train_op, zero_ops, accum_ops = \
                 _accum_gradients_ops(train_vars, opt, loss)
         else:
-            train_op = opt.minimize(loss, var_list=train_vars)
+            if gradient_checkpointing:
+                print ("****************** gradient checkpointing is enabled **************************")
+                opt_grads = memory_saving_gradients.gradients(loss, train_vars)
+            else:
+                opt_grads = tf.gradients(loss, train_vars)
+            opt_grads = list(zip(opt_grads, train_vars))
+            train_op = opt.apply_gradients(opt_grads)
 
         saver = tf.train.Saver(
             var_list=train_vars,

@@ -8,7 +8,28 @@ from tensorflow.contrib.training import HParams
 
 
 HPARAMS = {
-    'default': HParams(
+    '1542M': HParams(
+        n_vocab=0,
+        n_ctx=1024,
+        n_embd=1600,
+        n_head=24, # ?
+        n_layer=48,
+    ),
+    '762M': HParams(
+        n_vocab=0,
+        n_ctx=1024,
+        n_embd=1280,
+        n_head=20, # ?
+        n_layer=36,
+    ),
+    '345M': HParams(
+        n_vocab=0,
+        n_ctx=1024,
+        n_embd=1024,
+        n_head=16,
+        n_layer=24,
+    ),
+    '117M': HParams(
         n_vocab=0,
         n_ctx=1024,
         n_embd=768,
@@ -185,7 +206,7 @@ def positions_for(tokens, past_length):
     return expand_tile(past_length + tf.range(nsteps), batch_size)
 
 
-def model(hparams, X, past=None, scope='model', reuse=False):
+def model(hparams, X, past=None, scope='model', reuse=tf.AUTO_REUSE):
     with tf.variable_scope(scope, reuse=reuse):
         results = {}
         batch, sequence = shape_list(X)
@@ -206,6 +227,8 @@ def model(hparams, X, past=None, scope='model', reuse=False):
         assert len(pasts) == hparams.n_layer
         for layer, past in enumerate(pasts):
             h, present = block(h, 'h%d' % layer, past=past, hparams=hparams)
+            if layer == 10:
+                tf.add_to_collection('checkpoints', h)
             presents.append(present)
         results['present'] = tf.stack(presents, axis=1)
         h = norm(h, 'ln_f')
