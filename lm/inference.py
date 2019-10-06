@@ -30,6 +30,13 @@ class ModelWrapper:
         state = torch.load(root / 'model.pt', map_location='cpu')
         state_dict = fixed_state_dict(state['state_dict'])
         model.load_state_dict(state_dict)
+
+        tensor_list = list(state_dict.items())
+        for layer_tensor_name, tensor in tensor_list:
+            print("Layer %-42s: %9d elements" % (layer_tensor_name, torch.numel(tensor)))
+        pytorch_total_params = sum(p.numel() for p in model.parameters())
+        print ("Total # params: %d" % pytorch_total_params)
+
         return cls(model, sp_model)
 
     def tokenize(self, s: str) -> List[str]:
