@@ -18,7 +18,7 @@ class HParams:
     n_head: int
     n_layer: int
     gradient_checkpointing: bool
-
+    share_parameters: bool
 
 class Model(nn.Module):
     def __init__(self, hparams: HParams):
@@ -28,8 +28,14 @@ class Model(nn.Module):
         nn.init.normal_(self.wpe.weight, std=0.01)
         self.wte = nn.Embedding(hparams.n_vocab, hparams.n_embed)
         nn.init.normal_(self.wte.weight, std=0.02)
-        self.blocks = nn.ModuleList(
-            [Block(hparams) for _ in range(hparams.n_layer)])
+        if self.hparams.share_parameters:
+            b = Block(hparams)
+            self.blocks = nn.ModuleList(
+                [b for _ in range(hparams.n_layer)])
+        else:
+            self.blocks = nn.ModuleList(
+                [Block(hparams) for _ in range(hparams.n_layer)])
+
         self.ln_f = Norm(self.hparams.n_hidden)
         if hparams.n_hidden != hparams.n_embed:
             self.in_proj = Conv1D(hparams.n_embed, hparams.n_hidden)
@@ -38,14 +44,16 @@ class Model(nn.Module):
             self.in_proj = self.out_proj = None
 
     def forward(self, x, past=None):
+
         # Embedding
-        past_length = 0 if past is None else past.shape[-2]
-        batch_size, n_ctx = x.shape
-        position = position_for(batch_size, n_ctx, past_length, x.device)
-        h = self.wte(x) + self.wpe(position)
+        past_length = 0 if past is None else past.shape[-2]                     # past_length = 0
+        batch_size, n_ctx = x.shape                                             # batch_size=8, n_ctx=128
+        position = position_for(batch_size, n_ctx, past_length, x.device)       # position: [batch_size=8, n_ctx=128]
+        h = self.wte(x) + self.wpe(position)                                    # h: [batch_size=8, n_ctx=128, n_embed=128]
+
         assert h.shape == (batch_size, n_ctx, self.hparams.n_embed)
         if self.in_proj:
-            h = self.in_proj(h)
+            h = self.in_proj(h)                                                 # h: [batch_size=8, n_ctx=128, n_hidden=512]
         # Transformer
         presents = []
         for i, block in enumerate(self.blocks):
@@ -53,14 +61,20 @@ class Model(nn.Module):
                 h, present = torch.utils.checkpoint.checkpoint(block, h, past[:, i] if past is not None else None)
             else:
                 h, present = block(h, past=past[:, i] if past is not None else None)
+                                                                                # h: [batch_size=8, n_ctx=128, n_hidden=512]
+                                                                                # present: [batch_size=8, 2[k,v], n_head=8, n_ctx=128, 64]
             presents.append(present)
-        h = self.ln_f(h)
+
+        # presents: 12 x [batch_size=8, 2[k,v], n_head=8, n_ctx=128, 64]
+
+        h = self.ln_f(h)                                                        # h: [batch_size=8, n_ctx=128, n_hidden=512]
         if self.out_proj:
-            h = self.out_proj(h)
+            h = self.out_proj(h)                                                # h: [batch_size=8, n_ctx=128, n_embed=128]
         # Output logits
-        h_flat = h.reshape([batch_size * n_ctx, self.hparams.n_embed])
-        logits = torch.matmul(h_flat, self.wte.weight.t())
-        logits = logits.reshape([batch_size, n_ctx, self.hparams.n_vocab])
+        h_flat = h.reshape([batch_size * n_ctx, self.hparams.n_embed])          # [1024, 128]
+        logits = torch.matmul(h_flat, self.wte.weight.t())                      # [1024, 50000]
+        logits = logits.reshape([batch_size, n_ctx, self.hparams.n_vocab])      # [8, 128, 50000]
+
         return {
             'presents': torch.stack(tuple(presents), dim=1),
             'logits': logits,
@@ -75,11 +89,15 @@ class Block(nn.Module):
         self.mlp = MLP(hparams.n_hidden, hparams.n_hidden * 4)
         self.attn = Attention(hparams)
 
-    def forward(self, x, past):
-        a, present = self.attn(self.ln_1(x), past=past)
-        x = x + a
-        m = self.mlp(self.ln_2(x))
-        x = x + m
+    def forward(self, x, past):                                                 # x: [batch_size=8, n_ctx=128, n_hidden=512]
+                                                                                # past: None
+
+        a, present = self.attn(self.ln_1(x), past=past)                         # a: [batch_size=8, n_ctx=128, n_hidden=512]
+                                                                                # present: [batch_size=8, 2[k,v], n_head=8, n_ctx=128, 64]
+
+        x = x + a                                                               # x: [batch_size=8, n_ctx=128, n_hidden=512]
+        m = self.mlp(self.ln_2(x))                                              # m: [batch_size=8, n_ctx=128, n_hidden=512]
+        x = x + m                                                               # x: [batch_size=8, n_ctx=128, n_hidden=512]
         return x, present
 
 
@@ -122,23 +140,27 @@ class Attention(nn.Module):
         self.c_attn = Conv1D(hparams.n_hidden, hparams.n_hidden * 3)
         self.c_proj = Conv1D(hparams.n_hidden, hparams.n_hidden)
 
-    def forward(self, x, past):
-        assert len(x.shape) == 3  # [batch, sequence, features]
+    def forward(self, x, past):                                                 # x: [batch_size=8, n_ctx=128, n_hidden=512]
+                                                                                # past: None
+
+        assert len(x.shape) == 3
         assert x.shape[-1] == self.hparams.n_hidden
         if past is not None:
             # Should be [batch, 2, heads, sequence, features], where 2 is [k, v]
             assert len(past.shape) == 5
-            assert past.shape[-1] == self.hparams.n_hidden
-        c = self.c_attn(x)
-        q, k, v = map(self.split_heads, torch.split(c, x.shape[-1], dim=2))
-        present = torch.stack([k, v], dim=1)
+            # assert past.shape[-1] == self.hparams.n_hidden
+        c = self.c_attn(x)                                                      # c: [batch_size=8, n_ctx=128, 3*n_hidden=1536]
+        q, k, v = map(self.split_heads, torch.split(c, x.shape[-1], dim=2))     # q: [batch_size=8, n_head=8, n_ctx=128, 64]
+                                                                                # k: [batch_size=8, n_head=8, n_ctx=128, 64]
+                                                                                # v: [batch_size=8, n_head=8, n_ctx=128, 64]
+        present = torch.stack([k, v], dim=1)                                    # present: [batch_size=8, 2[k,v], n_head=8, n_ctx=128, 64]
         if past is not None:
             pk, pv = past[:, 0], past[:, 1]
             k = torch.cat([pk, k], dim=-2)
             v = torch.cat([pv, v], dim=-2)
-        a = self.multihead_attn(q, k, v)
-        a = self.merge_heads(a)
-        a = self.c_proj(a)
+        a = self.multihead_attn(q, k, v)                                        # a: [batch_size=8, 2[k,v], n_head=8, n_ctx=128, 64]
+        a = self.merge_heads(a)                                                 # a: [batch_size=8, n_ctx=128, n_hidden=512]
+        a = self.c_proj(a)                                                      # a: [batch_size=8, n_ctx=128, n_hidden=512]
         return a, present
 
     def split_heads(self, x):

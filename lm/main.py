@@ -31,6 +31,7 @@ def main(
         batch_size=2,  # per GPU
         g_accum_gradients=None,  # accumulate gradients N times (globally)
         gradient_checkpointing=False, # saves GPU memory
+        share_parameters=False, # share weights between all transformer layers 
         n_ctx=1024,
         n_embed=768,
         n_head=12,
@@ -88,6 +89,7 @@ def main(
         n_head=n_head,
         n_layer=n_layer,
         gradient_checkpointing=gradient_checkpointing,
+        share_parameters=share_parameters,
     )
     params = dict(
         hparams=attr.asdict(hparams),
@@ -119,6 +121,9 @@ def main(
     optimizer = optim.Adam(model.parameters(), lr=lr)
     loss_meter = AverageMeter()
     cudnn.benchmark = True
+
+    pytorch_total_params = sum(p.numel() for p in model.parameters())
+    print ("Total # params: %d" % pytorch_total_params)
 
     seen_tokens = 0
 
