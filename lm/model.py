@@ -9,6 +9,7 @@ from torch import nn
 from torch.nn import functional as F
 import torch.utils.checkpoint
 
+
 @attr.s(auto_attribs=True, frozen=True)
 class HParams:
     n_vocab: int
