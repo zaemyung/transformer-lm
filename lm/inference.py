@@ -3,13 +3,20 @@ from pathlib import Path
 from typing import List, Tuple
 
 import sentencepiece as spm
+from tqdm import tqdm
 import torch
+from torch.nn.utils.rnn import pad_sequence
 import numpy as np
 import fire
 from .fire_utils import only_allow_defined_args
 
 from .model import Model, HParams
 from .common import END_OF_LINE, END_OF_TEXT
+
+
+def yield_n_sized_chunks(lst, n):
+    for i in range(0, len(lst), n):
+        yield lst[i:i + n]
 
 
 class ModelWrapper:
@@ -35,9 +42,8 @@ class ModelWrapper:
         for layer_tensor_name, tensor in tensor_list:
             print("Layer %-42s: %9d elements" % (layer_tensor_name, torch.numel(tensor)))
         pytorch_total_params = sum(p.numel() for p in model.parameters())
-        print ("Total # params: %d" % pytorch_total_params)
-
-        return cls(model, sp_model)
+        print("Total # params: %d" % pytorch_total_params)
+        return cls(model.cuda(), sp_model)
 
     def tokenize(self, s: str) -> List[str]:
         return self.sp_model.EncodeAsPieces(s)
@@ -47,6 +53,35 @@ class ModelWrapper:
 
     def id_to_token(self, token_id: int) -> str:
         return self.sp_model.IdToPiece(int(token_id))
+
+    def get_lm_scores(self, sentences: List[str], batch_size: int = 70) -> torch.Tensor:
+        if isinstance(sentences, str):
+            sentences = [sentences]
+        sent_chunks = list(yield_n_sized_chunks(sentences, batch_size))
+        results = []
+        for chunk in tqdm(sent_chunks, total=len(sent_chunks)):
+            res = self._get_lm_scores(chunk)
+            results.extend(res)
+        return results
+
+    def _get_lm_scores(self, sentences: List[str]) -> torch.Tensor:
+        with torch.no_grad():
+            sentences_tok = [[self.END_OF_TEXT] + self.tokenize(s) + [self.END_OF_TEXT] for s in sentences]
+            sentences_tok_len = [len(toks) - 1 for toks in sentences_tok]
+            sentences_ids = [torch.LongTensor([self.token_to_id(t) for t in tokens]) for tokens in sentences_tok]
+
+            # pad sequence
+            sentences_ids_padded = pad_sequence(sentences_ids, batch_first=True).cuda()
+
+            log_probs = torch.log_softmax(self.model(sentences_ids_padded)['logits'], dim=2)
+            results = []
+            for i, tokens in enumerate(sentences_tok):
+                tok_len = sentences_tok_len[i]
+                tok_ids = [self.token_to_id(token) for token in tokens[1:tok_len]]
+                logits = torch.diag(log_probs[i, :tok_len - 1, tok_ids], 0)
+                sum_prob = torch.sum(logits) / (tok_len - 1)
+                results.append(sum_prob.detach().cpu().item())
+        return results
 
     def get_log_probs(self, tokens: List[str]) -> torch.Tensor:
         """ Return a tensor with shape (len(tokens), len(self.sp_model)),
@@ -100,7 +135,7 @@ class ModelWrapper:
             next_token_n = np.random.choice(top_k, p=probs)
             next_token = ntk[next_token_n][1]
             # print (next_token)
-            
+
             tokens.append(next_token)
 
         return tokens
@@ -112,6 +147,7 @@ def fixed_state_dict(state_dict):
         state_dict = {k[len('module.'):]: v for k, v in state_dict.items()}
     return state_dict
 
+
 def gen_main(model_path, prefix, tokens_to_generate=42, top_k=8):
 
     print("loading model from %s" % model_path)
@@ -122,6 +158,7 @@ def gen_main(model_path, prefix, tokens_to_generate=42, top_k=8):
 
     tokens_gen = mw.generate_tokens(tokens, tokens_to_generate, top_k)
     print(mw.sp_model.DecodePieces(tokens_gen))
+
 
 def fire_gen_main():
     fire.Fire(only_allow_defined_args(gen_main))
